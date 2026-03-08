@@ -8,7 +8,7 @@ This post outlines a modern solution to creating a scalable threat intelligence 
 
   
 
-The blog post is split into three sections:
+The blog post is split into five sections:
 
 1. **System Requirements** - The section highlights the main system requirements of the implementation
 2. **Architecture** - The section focuses on the architectural view of the implementation, limitations, and potential adaptations that can fit into a wider ecosystem that has access to dedicated finances.
