@@ -1,0 +1,1280 @@
+{
+  "name": "Tiered Threat Intelligence Pipeline",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 7,19 * * *"
+            }
+          ]
+        }
+      },
+      "id": "32c54392-3989-4c42-b571-e7260d92e460",
+      "name": "Trigger — 07:00 & 19:00",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "position": [
+        832,
+        1104
+      ],
+      "typeVersion": 1.2
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://LOCALHOST/graphql",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "openCtiApi",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"query\": \"query GetRecentReports($after: Any!) { reports(first: 5000, orderBy: created_at, orderMode: desc, filters: { mode: and, filters: [{ key: \\\"created_at\\\", values: [$after], operator: gte }], filterGroups: [] }) { edges { node { id standard_id name description report_types confidence created_at published objectLabel { value } objectMarking { definition } createdBy { ... on Identity { id name } } externalReferences { edges { node { url source_name } } } objects(first: 100) { edges { node { ... on AttackPattern { id entity_type name x_mitre_id } ... on Malware { id entity_type name } ... on ThreatActor { id entity_type name } ... on IntrusionSet { id entity_type name } ... on Vulnerability { id entity_type name } ... on Campaign { id entity_type name } ... on Tool { id entity_type name } ... on Indicator { id entity_type pattern } ... on StixCyberObservable { id entity_type observable_value } } } } } } } }\",\n  \"variables\": {\n    \"after\": \"{{ $now.minus({hours: 12}).toISO() }}\"\n  }\n}",
+        "options": {}
+      },
+      "id": "fe7d4975-40cd-452c-9b58-348505220d84",
+      "name": "OpenCTI — Fetch Reports",
+      "type": "n8n-nodes-base.httpRequest",
+      "position": [
+        1104,
+        1104
+      ],
+      "typeVersion": 4.2,
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "nFlbSD3VTeUmKTOt",
+          "name": "MB Abuse.ch"
+        },
+        "openCtiApi": {
+          "id": "UUw1V7j0OtCGOcNE",
+          "name": "OpenCTI account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "var edges = items[0]?.json?.data?.reports?.edges || [];\n\nif (edges.length === 0) {\n  return [{ json: { _empty: true, message: 'No new reports found' } }];\n}\n\nreturn edges.map(function(edge) {\n  var r = edge.node;\n  \n  var entities = (r.objects?.edges || []).map(function(e) {\n    var n = e.node;\n    return {\n      id: n.id,\n      type: n.entity_type || 'unknown',\n      name: n.name || n.observable_value || n.pattern || 'unknown',\n      mitre_id: n.x_mitre_id || null\n    };\n  });\n  \n  var labels = [];\n  if (Array.isArray(r.objectLabel)) {\n    labels = r.objectLabel.map(function(l) { return l.value || l; });\n  }\n  \n  var tlp = 'TLP:CLEAR';\n  if (Array.isArray(r.objectMarking)) {\n    for (var i = 0; i < r.objectMarking.length; i++) {\n      var def = r.objectMarking[i].definition || '';\n      if (def.indexOf('TLP') > -1) { tlp = def; break; }\n    }\n  }\n  \n  var refs = (r.externalReferences?.edges || []).map(function(e) {\n    return { url: e.node.url, source: e.node.source_name };\n  });\n  \n  return {\n    json: {\n      opencti_id: r.standard_id || r.id,\n      title: r.name,\n      description: r.description || '',\n      report_types: r.report_types || [],\n      confidence: r.confidence || 0,\n      created_at: r.created_at,\n      published_at: r.published,\n      created_by: r.createdBy?.name || null,\n      created_by_id: r.createdBy?.id || null,\n      tlp: tlp,\n      labels: labels,\n      entities: entities,\n      external_refs: refs,\n      raw_json: r\n    }\n  };\n});"
+      },
+      "id": "93e6d846-0d06-4265-a403-f294272ffa12",
+      "name": "Parse & Flatten Reports",
+      "type": "n8n-nodes-base.code",
+      "position": [
+        1360,
+        1104
+      ],
+      "typeVersion": 2
+    },
+    {
+      "parameters": {
+        "jsCode": "var MICROSOFT_ID = '67209902-ed0f-4679-85f9-768d05a639b7';\nvar ALIENVAULT_ID = 'c998e145-ba64-47e8-8262-3333dee66dbb';\nvar IP_REGEX = /\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}/;\nvar HASH_REGEX = /[a-f0-9]{32,64}/i;\nvar CVE_REGEX = /CVE-\\d{4}-\\d+/i;\nvar THREAT_KEYWORDS = /ransomware|apt\\d|malware|exploit|zero.day|backdoor|trojan|botnet|c2|command.and.control|data.leak|breach|credential|phishing.kit|stealer|loader|rat\\b|rootkit/i;\nvar CVE_FEED_PATTERNS = /cveNotify|CVE_Notify|cve_notify|vulnNotify|CVEfeed/i;\n\nvar results = [];\nvar counts = { tier1: 0, alienvault: 0, skip: 0 };\n\nfor (var i = 0; i < items.length; i++) {\n  var r = items[i].json;\n  if (r._empty) continue;\n  \n  var authorId = r.created_by_id || null;\n  var authorName = r.created_by || null;\n  var tier = 'tier1';\n  \n  // Get source URL for feed detection\n  var sourceUrl = '';\n  var refs = r.external_refs || [];\n  if (refs.length > 0 && refs[0].url) sourceUrl = refs[0].url;\n  \n  if (authorId === MICROSOFT_ID) {\n    tier = 'skip';\n  } else if (authorId === ALIENVAULT_ID) {\n    tier = 'alienvault';\n  } else if (authorName === null) {\n    var text = (r.title || '') + ' ' + (r.description || '');\n    var isTelegramCVEFeed = /t\\.me\\/cveNotify/i.test(sourceUrl);\n    // Skip known Telegram CVE notification feeds — these are bulk CVE dumps, not intelligence\n    if (CVE_FEED_PATTERNS.test(text) || CVE_FEED_PATTERNS.test(sourceUrl) || isTelegramCVEFeed) {\n      tier = 'skip';\n    } else {\n      var hasIOC = IP_REGEX.test(text) || HASH_REGEX.test(text) || CVE_REGEX.test(text) || THREAT_KEYWORDS.test(text);\n      tier = hasIOC ? 'tier1' : 'skip';\n    }\n  }\n  \n  r._tier = tier;\n  counts[tier] = (counts[tier] || 0) + 1;\n  results.push({ json: r });\n}\n\nresults.unshift({\n  json: {\n    _tier: 'summary',\n    _tier_counts: counts,\n    _message: 'Tier1: ' + counts.tier1 + ', AlienVault: ' + counts.alienvault + ', Skipped: ' + counts.skip\n  }\n});\n\nreturn results;"
+      },
+      "id": "794ad6c2-01d4-4a26-a788-ac8b4d61e1a4",
+      "name": "Route by Source Tier",
+      "type": "n8n-nodes-base.code",
+      "position": [
+        1632,
+        1104
+      ],
+      "typeVersion": 2
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "version": 2,
+            "caseSensitive": true,
+            "typeValidation": "loose"
+          },
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "not-skip",
+              "operator": {
+                "type": "string",
+                "operation": "notEquals"
+              },
+              "leftValue": "={{ $json._tier }}",
+              "rightValue": "skip"
+            },
+            {
+              "id": "not-summary",
+              "operator": {
+                "type": "string",
+                "operation": "notEquals"
+              },
+              "leftValue": "={{ $json._tier }}",
+              "rightValue": "summary"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "11f15cdc-9bac-42af-a140-e8fa42d8582a",
+      "name": "IF Not Skipped",
+      "type": "n8n-nodes-base.if",
+      "position": [
+        1872,
+        1104
+      ],
+      "typeVersion": 2.2
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "is-av",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              },
+              "leftValue": "={{ $json._tier }}",
+              "rightValue": "alienvault"
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "b73776ac-74b9-41d5-b4ef-84f51d4a15c5",
+      "name": "IF AlienVault",
+      "type": "n8n-nodes-base.if",
+      "position": [
+        2112,
+        1104
+      ],
+      "typeVersion": 2.2
+    },
+    {
+      "parameters": {
+        "jsCode": "var avReports = items.slice();\navReports.sort(function(a, b) {\n  return (b.json.entities || []).length - (a.json.entities || []).length;\n});\n\nvar capped = avReports.slice(0, 20);\n\nreturn capped.map(function(item) {\n  var r = item.json;\n  var sourceUrl = '';\n  var refs = r.external_refs || [];\n  if (refs.length > 0 && refs[0].url) sourceUrl = refs[0].url;\n  \n  var actors = [], malware = [], techniques = [], vulnerabilities = [];\n  var entities = r.entities || [];\n  \n  for (var i = 0; i < entities.length; i++) {\n    var e = entities[i];\n    var t = (e.type || '').toLowerCase();\n    if (t.indexOf('threat') > -1) actors.push(e.name);\n    else if (t.indexOf('malware') > -1) malware.push(e.name);\n    else if (t.indexOf('attack') > -1) techniques.push((e.mitre_id || '') + ' ' + e.name);\n    else if (t.indexOf('vuln') > -1) vulnerabilities.push(e.name);\n  }\n  \n  return {\n    json: {\n      _tier: 'alienvault',\n      opencti_id: r.opencti_id,\n      title: r.title,\n      description: (r.description || '').substring(0, 500),\n      source: 'AlienVault OTX',\n      source_url: sourceUrl,\n      confidence: r.confidence,\n      tlp: r.tlp,\n      labels: r.labels,\n      entities: r.entities,\n      external_refs: r.external_refs,\n      threat_actors: actors,\n      malware_families: malware,\n      attack_techniques: techniques,\n      cves_mentioned: vulnerabilities,\n      targeted_sectors: [],\n      severity_assessment: actors.length > 0 || malware.length > 0 ? 'high' : 'medium',\n      report_type: 'threat-report',\n      executive_summary: r.title\n    }\n  };\n});"
+      },
+      "id": "6470e455-5a5a-4244-b783-dbcf98b88cd0",
+      "name": "AlienVault Light Process",
+      "type": "n8n-nodes-base.code",
+      "position": [
+        2352,
+        944
+      ],
+      "typeVersion": 2
+    },
+    {
+      "parameters": {
+        "jsCode": "return items.map(function(item) {\n  var r = item.json;\n  var sourceUrl = '';\n  var refs = r.external_refs || [];\n  if (refs.length > 0 && refs[0].url) sourceUrl = refs[0].url;\n\n  return {\n    json: {\n      opencti_id: r.opencti_id || '', title: r.title || 'Untitled',\n      description: (r.description || '').substring(0, 10000), summary: r.title,\n      report_type: 'threat-report', source: 'AlienVault OTX', source_url: sourceUrl,\n      confidence: parseInt(r.confidence) || 0, severity: r.severity_assessment || 'medium',\n      tlp: r.tlp || 'TLP:CLEAR', published_at: new Date().toISOString(),\n      raw_json: JSON.stringify({ threat_actors: r.threat_actors, malware_families: r.malware_families, attack_techniques: r.attack_techniques, cves_mentioned: r.cves_mentioned, labels: r.labels, tier: 'alienvault_light' })\n    }\n  };\n});"
+      },
+      "id": "ecbe9799-7f03-4a82-bb1d-451c0e77f3c1",
+      "name": "AV Prepare for Postgres",
+      "type": "n8n-nodes-base.code",
+      "position": [
+        2624,
+        944
+      ],
+      "typeVersion": 2
+    },
+    {
+      "parameters": {
+        "operation": "upsert",
+        "schema": {
+          "__rl": true,
+          "mode": "list",
+          "value": "public"
+        },
+        "table": {
+          "__rl": true,
+          "value": "threat_reports",
+          "mode": "list",
+          "cachedResultName": "threat_reports"
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "value": {
+            "confidence": 0
+          },
+          "matchingColumns": [
+            "opencti_id"
+          ],
+          "schema": [
+            {
+              "id": "opencti_id",
+              "displayName": "opencti_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "title",
+              "displayName": "title",
+              "required": true,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": false
+            },
+            {
+              "id": "description",
+              "displayName": "description",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": false
+            },
+            {
+              "id": "summary",
+              "displayName": "summary",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": false
+            },
+            {
+              "id": "report_type",
+              "displayName": "report_type",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": false
+            },
+            {
+              "id": "source",
+              "displayName": "source",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": false
+            },
+            {
+              "id": "source_url",
+              "displayName": "source_url",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": false
+            },
+            {
+              "id": "confidence",
+              "displayName": "confidence",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "canBeUsedToMatch": false
+            },
+            {
+              "id": "severity",
+              "displayName": "severity",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": false
+            },
+            {
+              "id": "tlp",
+              "displayName": "tlp",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": false
+            },
+            {
+              "id": "published_at",
+              "displayName": "published_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "dateTime",
+              "canBeUsedToMatch": false
+            },
+            {
+              "id": "raw_json",
+              "displayName": "raw_json",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "object",
+              "canBeUsedToMatch": false
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "id": "53ef8b96-d6a5-45c6-b3f6-3cf8d24ec061",
+      "name": "Postgres — Insert AV Report",
+      "type": "n8n-nodes-base.postgres",
+      "position": [
+        2880,
+        944
+      ],
+      "typeVersion": 2.5,
+      "credentials": {
+        "postgres": {
+          "id": "SHyzIWrVbH8eUFyD",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "return items.map(function(item) {\n  var data = item.json;\n  var url = '';\n  var refs = data.external_refs || [];\n  for (var i = 0; i < refs.length; i++) {\n    if (refs[i].url && refs[i].url.indexOf('http') === 0) { url = refs[i].url; break; }\n  }\n  data.fetch_url = url;\n  data.has_url = url.length > 0;\n  return { json: data };\n});"
+      },
+      "id": "82b0cbfc-d411-4000-a9ee-6d2a975cf008",
+      "name": "Prepare Article URL",
+      "type": "n8n-nodes-base.code",
+      "position": [
+        2352,
+        1248
+      ],
+      "typeVersion": 2
+    },
+    {
+      "parameters": {
+        "url": "={{ $json.fetch_url }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "User-Agent",
+              "value": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+            }
+          ]
+        },
+        "options": {
+          "redirect": {
+            "redirect": {
+              "maxRedirects": 5
+            }
+          },
+          "response": {
+            "response": {
+              "responseFormat": "text"
+            }
+          },
+          "timeout": 10000
+        }
+      },
+      "id": "31c0e214-417a-4b4e-94e8-6fbc4a315eba",
+      "name": "Fetch Full Article",
+      "type": "n8n-nodes-base.httpRequest",
+      "position": [
+        2624,
+        1248
+      ],
+      "typeVersion": 4.2,
+      "retryOnFail": false,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "return items.map(function(item, index) {\n  var original = $('Prepare Article URL').all()[index]?.json || {};\n  var fetched = item.json;\n  var fullText = '';\n\n  try {\n    var html = fetched.data || fetched.body || '';\n    if (typeof html === 'string' && html.length > 0) {\n      fullText = html\n        .replace(/<script[^>]*>[\\s\\S]*?<\\/script>/gi, '')\n        .replace(/<style[^>]*>[\\s\\S]*?<\\/style>/gi, '')\n        .replace(/<noscript[^>]*>[\\s\\S]*?<\\/noscript>/gi, '')\n        .replace(/<nav[^>]*>[\\s\\S]*?<\\/nav>/gi, '')\n        .replace(/<header[^>]*>[\\s\\S]*?<\\/header>/gi, '')\n        .replace(/<footer[^>]*>[\\s\\S]*?<\\/footer>/gi, '')\n        .replace(/<aside[^>]*>[\\s\\S]*?<\\/aside>/gi, '')\n        .replace(/<\\/?(p|div|br|h[1-6]|li|tr|blockquote)[^>]*>/gi, '\\n')\n        .replace(/<[^>]+>/g, '')\n        .replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '\"').replace(/&#x27;/g, \"'\").replace(/&#x2F;/g, '/').replace(/&nbsp;/g, ' ').replace(/&#\\d+;/g, '')\n        .replace(/[ \\t]+/g, ' ').replace(/\\n\\s*\\n/g, '\\n\\n').trim();\n      if (fullText.length > 4000) fullText = fullText.substring(0, 4000) + '\\n\\n[Truncated]';\n    }\n  } catch (err) { fullText = ''; }\n\n  var enrichedDescription = fullText.length > 100 ? fullText : original.description || '';\n\n  return {\n    json: {\n      _tier: original._tier || 'tier1',\n      opencti_id: original.opencti_id, title: original.title,\n      description: enrichedDescription, original_description: original.description || '',\n      report_types: original.report_types, confidence: original.confidence,\n      created_at: original.created_at, published_at: original.published_at,\n      created_by: original.created_by, tlp: original.tlp, labels: original.labels,\n      entities: original.entities, external_refs: original.external_refs,\n      raw_json: original.raw_json, was_enriched: fullText.length > 100\n    }\n  };\n});"
+      },
+      "id": "5b8f65ee-859a-41e4-91c1-cbba2643f869",
+      "name": "Extract Text & Merge",
+      "type": "n8n-nodes-base.code",
+      "position": [
+        2880,
+        1248
+      ],
+      "typeVersion": 2
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "=Analyse this threat report and return a structured JSON summary.\n\nTITLE: {{ $json.title }}\n\nDESCRIPTION:\n{{ $json.description || 'No description available — analyse based on title only.' }}\n\nRELATED ENTITIES:\n{{ $json.entities && $json.entities.length > 0 ? $json.entities.map(e => '- [' + e.type + '] ' + e.name + (e.mitre_id ? ' (' + e.mitre_id + ')' : '')).join('\\n') : 'None' }}\n\nLABELS: {{ $json.labels && $json.labels.length > 0 ? $json.labels.join(', ') : 'None' }}\nSOURCE: {{ $json.created_by || 'Unknown' }}\n\nReturn this exact JSON structure:\n{\n  \"report_type\": \"ONE of: threat-report, malware-analysis, vulnerability-alert, security-news, law-enforcement, best-practice, vendor-advisory\",\n  \"executive_summary\": \"2-3 sentence summary\",\n  \"technical_summary\": \"Technical TTPs detail or N/F\",\n  \"threat_actors\": [\"named actors or N/F\"],\n  \"malware_families\": [\"malware names or N/F\"],\n  \"attack_techniques\": [\"T1566 - Phishing or N/F\"],\n  \"targeted_sectors\": [\"sectors or N/F\"],\n  \"targeted_regions\": [\"regions or N/F\"],\n  \"iocs_mentioned\": [\"IPs, domains, hashes or N/F\"],\n  \"cves_mentioned\": [\"CVE-2025-XXXX or N/F\"],\n  \"severity_assessment\": \"ONE of: critical, high, medium, low, info\",\n  \"tags\": [\"at-least-three\", \"lowercase\", \"keywords\"],\n  \"kill_chain_phases\": [\"phase names or N/F\"]\n}",
+        "options": {
+          "systemMessage": "You are a senior threat intelligence analyst. Respond ONLY with valid JSON. No markdown fences, no preamble.\n\nRules:\n- NEVER return empty arrays [] or empty strings. Use \"N/F\" for text, [\"N/F\"] for arrays.\n- severity_assessment: critical (active zero-day, major breach), high (named APT, new malware), medium (law enforcement, disclosed breach), low (best practice, patch advisory), info (opinion, general news)\n- Do NOT assign MITRE ATT&CK techniques to geopolitical events, law enforcement actions, or general security news.\n- Nation states in military conflict are NOT cyber threat_actors. Only include cyber groups (APT37, Lazarus, FIN7, etc.).\n- Tags must have at least 3 entries.\n- report_type must be exactly ONE of: threat-report, malware-analysis, vulnerability-alert, security-news, law-enforcement, best-practice, vendor-advisory"
+        }
+      },
+      "id": "b678ce39-6a9d-44a5-85d9-b544ff56f7aa",
+      "name": "AI Agent - Analyse Report",
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "position": [
+        3136,
+        1248
+      ],
+      "retryOnFail": true,
+      "typeVersion": 1.9
+    },
+    {
+      "parameters": {
+        "jsCode": "var aiItems = items;\nvar originals = $('Extract Text & Merge').all();\nvar results = [];\n\nfor (var i = 0; i < aiItems.length; i++) {\n  var original = originals[i]?.json || {};\n  var aiResult = {};\n\n  try {\n    var rawResponse = aiItems[i].json.output || '';\n    var jsonMatch = rawResponse.match(/\\{[\\s\\S]*\\}/);\n    if (jsonMatch) aiResult = JSON.parse(jsonMatch[0]);\n  } catch (err) {\n    aiResult = { report_type: 'N/F', executive_summary: aiItems[i].json.output || 'AI parsing failed', technical_summary: 'N/F', threat_actors: ['N/F'], malware_families: ['N/F'], attack_techniques: ['N/F'], targeted_sectors: ['N/F'], targeted_regions: ['N/F'], iocs_mentioned: ['N/F'], cves_mentioned: ['N/F'], severity_assessment: 'medium', tags: ['N/F'], kill_chain_phases: ['N/F'] };\n  }\n\n  function toArray(val) { if (Array.isArray(val)) return val; if (typeof val === 'string') return [val]; return ['N/F']; }\n\n  results.push({\n    json: {\n      _tier: original._tier || 'tier1',\n      opencti_id: original.opencti_id, title: original.title, description: original.description,\n      original_description: original.original_description || '', report_types: original.report_types,\n      confidence: original.confidence, created_at: original.created_at, published_at: original.published_at,\n      created_by: original.created_by, tlp: original.tlp, labels: original.labels,\n      entities: original.entities, external_refs: original.external_refs, was_enriched: original.was_enriched,\n      report_type: aiResult.report_type || 'N/F', executive_summary: aiResult.executive_summary || 'N/F',\n      technical_summary: aiResult.technical_summary || 'N/F', threat_actors: toArray(aiResult.threat_actors),\n      malware_families: toArray(aiResult.malware_families), attack_techniques: toArray(aiResult.attack_techniques),\n      targeted_sectors: toArray(aiResult.targeted_sectors), targeted_regions: toArray(aiResult.targeted_regions),\n      iocs_mentioned: toArray(aiResult.iocs_mentioned), cves_mentioned: toArray(aiResult.cves_mentioned),\n      severity_assessment: aiResult.severity_assessment || 'medium', ai_tags: toArray(aiResult.tags),\n      kill_chain_phases: toArray(aiResult.kill_chain_phases),\n      all_tags: (original.labels || []).concat(toArray(aiResult.tags)).filter(function(v, idx, arr) { return arr.indexOf(v) === idx; })\n    }\n  });\n}\nreturn results;"
+      },
+      "id": "e554a488-a76f-43b7-88e2-ffe126e7a3c8",
+      "name": "Merge AI Summary",
+      "type": "n8n-nodes-base.code",
+      "position": [
+        3392,
+        1248
+      ],
+      "typeVersion": 2
+    },
+    {
+      "parameters": {
+        "jsCode": "return items.map(function(item) {\n  var r = item.json;\n  var summary = [r.executive_summary || 'N/F', r.technical_summary || 'N/F'].join('\\n\\n');\n  var sourceUrl = ''; var refs = r.external_refs || [];\n  if (refs.length > 0 && refs[0].url) sourceUrl = refs[0].url;\n\n  return {\n    json: {\n      opencti_id: r.opencti_id || '', title: r.title || 'Untitled',\n      description: (r.description || '').substring(0, 10000), summary: summary,\n      report_type: r.report_type || 'threat-report', source: r.created_by || 'Unknown',\n      source_url: sourceUrl, confidence: parseInt(r.confidence) || 0,\n      severity: r.severity_assessment || 'medium', tlp: r.tlp || 'TLP:CLEAR',\n      published_at: r.published_at || new Date().toISOString(),\n      raw_json: JSON.stringify({ threat_actors: r.threat_actors, malware_families: r.malware_families, attack_techniques: r.attack_techniques, targeted_sectors: r.targeted_sectors, targeted_regions: r.targeted_regions, iocs_mentioned: r.iocs_mentioned, cves_mentioned: r.cves_mentioned, ai_tags: r.ai_tags, kill_chain_phases: r.kill_chain_phases, was_enriched: r.was_enriched, tier: r._tier })\n    }\n  };\n});"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3664,
+        1248
+      ],
+      "id": "52c7acb2-e871-40ff-a601-4bcf8f4c9041",
+      "name": "Prepare for Postgres"
+    },
+    {
+      "parameters": {
+        "operation": "upsert",
+        "schema": {
+          "__rl": true,
+          "mode": "list",
+          "value": "public"
+        },
+        "table": {
+          "__rl": true,
+          "value": "threat_reports",
+          "mode": "list",
+          "cachedResultName": "threat_reports"
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "value": {
+            "confidence": 0
+          },
+          "matchingColumns": [
+            "opencti_id"
+          ],
+          "schema": [
+            {
+              "id": "opencti_id",
+              "displayName": "opencti_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "title",
+              "displayName": "title",
+              "required": true,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": false
+            },
+            {
+              "id": "description",
+              "displayName": "description",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": false
+            },
+            {
+              "id": "summary",
+              "displayName": "summary",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": false
+            },
+            {
+              "id": "report_type",
+              "displayName": "report_type",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": false
+            },
+            {
+              "id": "source",
+              "displayName": "source",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": false
+            },
+            {
+              "id": "source_url",
+              "displayName": "source_url",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": false
+            },
+            {
+              "id": "confidence",
+              "displayName": "confidence",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "canBeUsedToMatch": false
+            },
+            {
+              "id": "severity",
+              "displayName": "severity",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": false
+            },
+            {
+              "id": "tlp",
+              "displayName": "tlp",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": false
+            },
+            {
+              "id": "published_at",
+              "displayName": "published_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "dateTime",
+              "canBeUsedToMatch": false
+            },
+            {
+              "id": "raw_json",
+              "displayName": "raw_json",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "object",
+              "canBeUsedToMatch": false
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "id": "d97cf136-cb41-4e8c-8d76-8cf1b48d7b5f",
+      "name": "Postgres — Insert Report",
+      "type": "n8n-nodes-base.postgres",
+      "position": [
+        3920,
+        1248
+      ],
+      "typeVersion": 2.5,
+      "credentials": {
+        "postgres": {
+          "id": "SHyzIWrVbH8eUFyD",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "return items.map(function(item, index) {\n  var report = $('Merge AI Summary').all()[index]?.json || {};\n  var pgResult = item.json;\n  var reportDbId = pgResult?.id;\n  if (!reportDbId) return { json: { _skip: true, error: 'No report ID' } };\n\n  function clean(arr) { return (arr || []).filter(function(v) { return v && v !== 'N/F' && v.indexOf('N/F') !== 0; }); }\n\n  var allEntities = [];\n  var entityList = clean((report.entities || []).map(function(e) { return e.name; }));\n  for (var i = 0; i < entityList.length; i++) {\n    var e = report.entities[i];\n    allEntities.push({ type: (e.type || 'unknown').toLowerCase().replace(/\\s+/g, '-'), name: entityList[i], stix_id: e.id || null });\n  }\n  var actors = clean(report.threat_actors);\n  for (var a = 0; a < actors.length; a++) allEntities.push({ type: 'threat-actor', name: actors[a], stix_id: null });\n  var mal = clean(report.malware_families);\n  for (var m = 0; m < mal.length; m++) allEntities.push({ type: 'malware', name: mal[m], stix_id: null });\n  var tech = clean(report.attack_techniques);\n  for (var t = 0; t < tech.length; t++) allEntities.push({ type: 'attack-pattern', name: tech[t], stix_id: null });\n\n  var seen = {};\n  var uniq = allEntities.filter(function(e) { var k = e.type + '::' + e.name; if (seen[k]) return false; seen[k] = true; return true; });\n\n  var tagList = clean(report.all_tags || []);\n  var tags = tagList.map(function(t) { return { tag: t, category: 'general' }; });\n\n  return { json: { report_db_id: reportDbId, entities: uniq, tags: tags } };\n});"
+      },
+      "id": "f85ce6ce-4bfe-40d4-b1b2-cfbbfd10c611",
+      "name": "Prepare Entities & Tags",
+      "type": "n8n-nodes-base.code",
+      "position": [
+        4176,
+        1248
+      ],
+      "typeVersion": 2
+    },
+    {
+      "parameters": {
+        "jsCode": "var results = [];\nfor (var i = 0; i < items.length; i++) {\n  var r = items[i].json;\n  if (r._skip) continue;\n  var entities = r.entities || [];\n  for (var e = 0; e < entities.length; e++) {\n    results.push({ json: { query_type: 'entity', entity_type: entities[e].type, entity_name: entities[e].name, stix_id: entities[e].stix_id, report_id: r.report_db_id } });\n  }\n  var tags = r.tags || [];\n  for (var t = 0; t < tags.length; t++) {\n    results.push({ json: { query_type: 'tag', tag: tags[t].tag, category: tags[t].category, report_id: r.report_db_id } });\n  }\n}\nreturn results.length > 0 ? results : [{ json: { query_type: 'none', message: 'Nothing to insert' } }];"
+      },
+      "id": "47ba12e1-a150-438d-8850-ec63ab572107",
+      "name": "Flatten for DB Insert",
+      "type": "n8n-nodes-base.code",
+      "position": [
+        4432,
+        1248
+      ],
+      "typeVersion": 2
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "version": 2,
+            "caseSensitive": true,
+            "typeValidation": "loose"
+          },
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "is-entity",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              },
+              "leftValue": "={{ $json.query_type }}",
+              "rightValue": "entity"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "684f52b7-b91c-4f4d-9ee2-205542fe8ae2",
+      "name": "IF Entity or Tag",
+      "type": "n8n-nodes-base.if",
+      "position": [
+        4704,
+        1248
+      ],
+      "typeVersion": 2.2
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "WITH ent AS (\n  INSERT INTO entities (entity_type, name, stix_id, last_seen)\n  VALUES (\n    '{{ $json.entity_type.replaceAll(\"'\", \"''\") }}',\n    '{{ $json.entity_name.replaceAll(\"'\", \"''\") }}',\n    {{ $json.stix_id ? \"'\" + $json.stix_id.replaceAll(\"'\", \"''\") + \"'\" : 'NULL' }},\n    NOW()\n  )\n  ON CONFLICT (entity_type, name) DO UPDATE SET last_seen = NOW()\n  RETURNING id\n)\nINSERT INTO report_entities (report_id, entity_id, relationship)\nSELECT '{{ $json.report_id }}', ent.id, 'mentions' FROM ent\nON CONFLICT DO NOTHING;",
+        "options": {}
+      },
+      "id": "504341c5-9e19-4b94-84ba-e5a6d6448643",
+      "name": "Postgres — Insert Entity + Link",
+      "type": "n8n-nodes-base.postgres",
+      "position": [
+        4960,
+        1152
+      ],
+      "typeVersion": 2.5,
+      "credentials": {
+        "postgres": {
+          "id": "SHyzIWrVbH8eUFyD",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "=INSERT INTO report_tags (report_id, tag, category)\nVALUES (\n  '{{ $json.report_id }}',\n  '{{ $json.tag.replaceAll(\"'\", \"''\") }}',\n  '{{ $json.category.replaceAll(\"'\", \"''\") }}'\n)\nON CONFLICT DO NOTHING;",
+        "options": {}
+      },
+      "id": "d78b3948-4c9f-4f04-ba97-909da9b1148e",
+      "name": "Postgres — Insert Tag",
+      "type": "n8n-nodes-base.postgres",
+      "position": [
+        4960,
+        1360
+      ],
+      "typeVersion": 2.5,
+      "credentials": {
+        "postgres": {
+          "id": "SHyzIWrVbH8eUFyD",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// IMPROVED: Build structured correlation prompt for phi4\n// Groups reports by theme first, forces per-report acknowledgment\n\nfunction filterNF(arr) { return (arr || []).filter(function(v) { return v && v !== 'N/F'; }); }\n\n// Collect Tier 1 reports\nvar tier1 = $('Merge AI Summary').all();\nvar allForCorrelation = [];\n\nfor (var i = 0; i < tier1.length; i++) {\n  var r = tier1[i].json;\n  allForCorrelation.push({\n    title: r.title || 'Untitled',\n    source: r.created_by || 'Unknown',\n    tier: 'Full Analysis',\n    actors: filterNF(r.threat_actors),\n    malware: filterNF(r.malware_families),\n    ttps: filterNF(r.attack_techniques),\n    sectors: filterNF(r.targeted_sectors),\n    regions: filterNF(r.targeted_regions),\n    cves: filterNF(r.cves_mentioned),\n    severity: r.severity_assessment || 'unknown',\n    summary: (r.executive_summary || '').substring(0, 150),\n    external_refs: r.external_refs || []\n  });\n}\n\n// Collect Tier 2 AlienVault reports\nvar tier2 = [];\ntry { tier2 = $('AlienVault Light Process').all(); } catch(e) {}\n\nfor (var j = 0; j < tier2.length; j++) {\n  var a = tier2[j].json;\n  allForCorrelation.push({\n    title: a.title || 'Untitled',\n    source: 'AlienVault OTX',\n    tier: 'IOC Feed',\n    actors: a.threat_actors || [],\n    malware: a.malware_families || [],\n    ttps: a.attack_techniques || [],\n    sectors: [],\n    regions: [],\n    cves: a.cves_mentioned || [],\n    severity: a.severity_assessment || 'medium',\n    summary: '',\n    external_refs: a.external_refs || []\n  });\n}\n\n// Build numbered report list for easy reference\nvar reportLines = [];\nfor (var k = 0; k < allForCorrelation.length; k++) {\n  var rep = allForCorrelation[k];\n  var line = '--- REPORT: ' + rep.title + ' ---';\n  line += '\\nSource: ' + rep.source + ' | Severity: ' + rep.severity;\n  if (rep.summary) line += '\\nSummary: ' + rep.summary;\n  if (rep.actors.length > 0) line += '\\nActors: ' + rep.actors.join(', ');\n  if (rep.malware.length > 0) line += '\\nMalware: ' + rep.malware.join(', ');\n  if (rep.ttps.length > 0) line += '\\nTTPs: ' + rep.ttps.join(', ');\n  if (rep.sectors.length > 0) line += '\\nSectors: ' + rep.sectors.join(', ');\n  if (rep.regions.length > 0) line += '\\nRegions: ' + rep.regions.join(', ');\n  if (rep.cves.length > 0) line += '\\nCVEs: ' + rep.cves.join(', ');\n  reportLines.push(line);\n}\n\nvar totalCount = allForCorrelation.length;\n\n// Pre-compute overlap hints to help the model\nvar actorMap = {}, malwareMap = {}, ttpMap = {}, sectorMap = {}, cveMap = {};\nfor (var m = 0; m < allForCorrelation.length; m++) {\n  var rr = allForCorrelation[m];\n  rr.actors.forEach(function(v) { if (!actorMap[v]) actorMap[v] = []; actorMap[v].push(rr.title); });\n  rr.malware.forEach(function(v) { if (!malwareMap[v]) malwareMap[v] = []; malwareMap[v].push(rr.title); });\n  rr.ttps.forEach(function(v) { if (!ttpMap[v]) ttpMap[v] = []; ttpMap[v].push(rr.title); });\n  rr.sectors.forEach(function(v) { if (!sectorMap[v]) sectorMap[v] = []; sectorMap[v].push(rr.title); });\n  rr.cves.forEach(function(v) { if (!cveMap[v]) cveMap[v] = []; cveMap[v].push(rr.title); });\n}\n\n// Build overlap hints (only items appearing in 2+ reports)\nvar hints = [];\nfunction addHints(map, label) {\n  Object.keys(map).forEach(function(key) {\n    if (map[key].length >= 2) {\n      hints.push(label + ' \"' + key + '\" appears in: ' + map[key].join(' | '));\n    }\n  });\n}\naddHints(actorMap, 'Actor');\naddHints(malwareMap, 'Malware');\naddHints(ttpMap, 'TTP');\naddHints(sectorMap, 'Sector');\naddHints(cveMap, 'CVE');\n\n// URL map for Discord\nvar urlMap = {};\nfor (var n = 0; n < allForCorrelation.length; n++) {\n  var refList = allForCorrelation[n].external_refs || [];\n  if (refList.length > 0 && refList[0].url) urlMap[allForCorrelation[n].title] = refList[0].url;\n}\n\nvar sampleTitle = allForCorrelation.length > 0 ? allForCorrelation[0].title : 'No Reports';\n\n// Build the prompt\nvar prompt = 'You are analysing ' + totalCount + ' threat intelligence reports (' + tier1.length + ' fully analysed, ' + tier2.length + ' from AlienVault IOC feeds).\\n\\n';\nprompt += 'REPORTS:\\n\\n' + reportLines.join('\\n\\n') + '\\n\\n';\n\nif (hints.length > 0) {\n  prompt += 'DETECTED OVERLAPS (pre-computed — use these as starting points):\\n';\n  prompt += hints.join('\\n') + '\\n\\n';\n}\n\nprompt += 'INSTRUCTIONS:\\n';\nprompt += '1. Review ALL ' + totalCount + ' reports above, not just the first few.\\n';\nprompt += '2. For each correlation, correlation_type must be exactly ONE of: ttp, actor, malware, sector, campaign, infrastructure. Pick the BEST match, do not list multiple.\\n';\nprompt += '3. Use the DETECTED OVERLAPS above as starting points, but also look for thematic connections.\\n';\nprompt += '4. confidence scoring: 0.9+ requires shared specific IOCs or identical actor+malware. 0.7-0.89 requires shared TTPs AND sector/region. 0.5-0.69 for thematic connections only. Do not report below 0.5.\\n';\nprompt += '5. T1566 (Phishing) alone is NOT a meaningful correlation.\\n';\nprompt += '6. Write a threat_landscape_summary that references specific reports and covers the FULL batch.\\n';\nprompt += '7. Use EXACT FULL TITLES from the input. NEVER say \"Report 1\" or abbreviate titles.\\n';\nprompt += '\\nWRONG title reference: \"Report 1 and Report 2\"\\nCORRECT title reference: \"' + sampleTitle + '\"\\n';\nprompt += '\\nReturn this JSON:\\n{\\n  \"cross_report_correlations\": [\\n    {\\n      \"reports\": [\"exact full title\", \"exact full title\"],\\n      \"shared_elements\": [\"specific shared items\"],\\n      \"correlation_type\": \"ONE of: ttp, actor, malware, sector, campaign, infrastructure\",\\n      \"confidence\": 0.5-1.0\\n    }\\n  ],\\n  \"emerging_trends\": [\\n    {\\n      \"trend\": \"specific trend description\",\\n      \"evidence\": [\"exact full report title\", \"exact full report title\"],\\n      \"risk_level\": \"ONE of: critical, high, medium, low\"\\n    }\\n  ],\\n  \"threat_landscape_summary\": \"2-3 paragraphs covering the full batch\"\\n}';\n\nreturn [{ json: { prompt: prompt, report_count: totalCount, tier1_count: tier1.length, tier2_count: tier2.length, url_map: urlMap, overlap_hints: hints.length } }];"
+      },
+      "id": "8c79fce0-1082-40e6-aec0-b7502e25cb8f",
+      "name": "Build Correlation Prompt",
+      "type": "n8n-nodes-base.code",
+      "position": [
+        3664,
+        1552
+      ],
+      "typeVersion": 2
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "={{ $json.prompt }}",
+        "options": {
+          "systemMessage": "You are a senior threat intelligence correlation analyst producing a daily intelligence briefing.\n\nOUTPUT RULES:\n- Respond ONLY with valid JSON. No markdown fences, no preamble, no explanation.\n- correlation_type must be exactly ONE value from: ttp, actor, malware, sector, campaign, infrastructure\n  WRONG: \"ttp|actor|malware\" or \"TTP|ACTOR\"\n  CORRECT: \"actor\" or \"ttp\" or \"malware\"\n- risk_level must be exactly ONE value from: critical, high, medium, low\n- confidence must be a decimal number between 0.5 and 1.0\n\nTITLE RULES:\n- You MUST use the EXACT FULL TITLE of each report as written in the input.\n- NEVER say \"Report 1\", \"Report 2\", or ANY numbered reference.\n- NEVER abbreviate or paraphrase titles.\n- Copy titles character-for-character from the input.\n\nANALYSIS RULES:\n- Review EVERY report in the batch, not just the first few.\n- Use the DETECTED OVERLAPS section as a starting point — these are pre-computed shared elements.\n- Look beyond obvious overlaps for thematic connections: same region + same timeframe, same sector under attack from different actors, related TTPs suggesting coordinated activity.\n- Do NOT force correlations. If two reports genuinely have nothing in common, do not correlate them.\n- T1566 (Phishing) alone is NEVER a meaningful correlation — it's too generic.\n- Geopolitical news only correlates with cyber reports if there is a specific cyber dimension.\n- The threat_landscape_summary MUST reference specific reports by title and cover the full scope of the batch, not just one or two reports."
+        }
+      },
+      "id": "f0d00de4-78ef-42cf-90fa-4b84fd4e9377",
+      "name": "AI Agent - Correlate",
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "position": [
+        3920,
+        1552
+      ],
+      "retryOnFail": true,
+      "typeVersion": 1.9
+    },
+    {
+      "parameters": {
+        "jsCode": "var raw = items[0]?.json?.output || items[0]?.json?.response || '';\nvar reportCount = $('Build Correlation Prompt').first().json.report_count || 0;\nvar urlMap = $('Build Correlation Prompt').first().json.url_map || {};\nvar tier1Count = $('Build Correlation Prompt').first().json.tier1_count || 0;\nvar tier2Count = $('Build Correlation Prompt').first().json.tier2_count || 0;\n\nvar result = {};\ntry {\n  var cleaned = raw.trim().replace(/```json\\s*/g, '').replace(/```\\s*/g, '');\n  var firstBrace = cleaned.indexOf('{');\n  if (firstBrace > 0) cleaned = cleaned.substring(firstBrace);\n  var lastBrace = cleaned.lastIndexOf('}');\n  if (lastBrace > 0) cleaned = cleaned.substring(0, lastBrace + 1);\n  cleaned = cleaned.replace(/,\\s*\\]/g, ']').replace(/,\\s*\\}/g, '}').replace(/[\\x00-\\x1F]/g, ' ');\n  result = JSON.parse(cleaned);\n} catch (e) {\n  try {\n    var summaryMatch = raw.match(/\"threat_landscape_summary\"\\s*:\\s*\"([\\s\\S]*?)\"\\s*\\}?\\s*$/);\n    if (summaryMatch) result.threat_landscape_summary = summaryMatch[1];\n    result.cross_report_correlations = result.cross_report_correlations || [];\n    result.emerging_trends = result.emerging_trends || [];\n  } catch (e2) {\n    result = { cross_report_correlations: [], emerging_trends: [], threat_landscape_summary: 'Parse failed: ' + raw.substring(0, 300) };\n  }\n}\n\n// Fix correlation_type if model returned pipe-separated values\nvar corrs = result.cross_report_correlations || [];\nfor (var i = 0; i < corrs.length; i++) {\n  var ct = corrs[i].correlation_type || '';\n  if (ct.indexOf('|') > -1) {\n    // Pick the first valid one\n    var parts = ct.split('|').map(function(p) { return p.trim().toLowerCase(); });\n    var valid = ['ttp', 'actor', 'malware', 'sector', 'campaign', 'infrastructure'];\n    for (var v = 0; v < parts.length; v++) {\n      if (valid.indexOf(parts[v]) > -1) { corrs[i].correlation_type = parts[v]; break; }\n    }\n  }\n}\n\nvar summary = result.threat_landscape_summary || '';\nif (summary.indexOf('{') === 0) summary = 'Correlation completed but parsing failed.';\n\nreturn [{ json: { correlations: corrs, trends: result.emerging_trends || [], landscape_summary: summary, batch_size: reportCount, tier1_count: tier1Count, tier2_count: tier2Count, url_map: urlMap, timestamp: new Date().toISOString() } }];"
+      },
+      "id": "c02f3be7-a523-4168-911f-005928fb36c1",
+      "name": "Parse Correlation Results",
+      "type": "n8n-nodes-base.code",
+      "position": [
+        4176,
+        1552
+      ],
+      "typeVersion": 2
+    },
+    {
+      "parameters": {
+        "jsCode": "var r = items[0].json;\nvar urlMap = r.url_map || {};\nvar date = new Date().toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' });\n\nvar icons = { critical: '\\ud83d\\udfe5', high: '\\ud83d\\udfe7', medium: '\\ud83d\\udfe8', low: '\\ud83d\\udfe9', info: '\\ud83d\\udfe6' };\n\nfunction linkTitle(title) {\n  if (!title) return 'Unknown';\n  if (urlMap[title]) return '[' + title + '](<' + urlMap[title] + '>)';\n  var normalised = title.toLowerCase().replace(/[^a-z0-9]/g, '');\n  var keys = Object.keys(urlMap);\n  for (var k = 0; k < keys.length; k++) {\n    var keyNorm = keys[k].toLowerCase().replace(/[^a-z0-9]/g, '');\n    if (keyNorm.indexOf(normalised) > -1 || normalised.indexOf(keyNorm) > -1) {\n      return '[' + title + '](<' + urlMap[keys[k]] + '>)';\n    }\n    if (normalised.substring(0, 30) === keyNorm.substring(0, 30) && normalised.length > 10) {\n      return '[' + title + '](<' + urlMap[keys[k]] + '>)';\n    }\n  }\n  return title;\n}\n\nfunction riskIcon(level) {\n  var l = String(level || 'unknown').toLowerCase();\n  return icons[l] || icons.info;\n}\n\nfunction confIcon(c) {\n  if (c >= 0.8) return icons.critical;\n  if (c >= 0.6) return icons.high;\n  if (c >= 0.4) return icons.medium;\n  return icons.low;\n}\n\nvar blocks = [];\n\nblocks.push('# Threat Correlation Report \\u2014 ' + date + '\\n**Batch:** ' + r.batch_size + ' reports (' + r.tier1_count + ' full analysis + ' + r.tier2_count + ' AlienVault)');\n\nif (r.landscape_summary) {\n  blocks.push('## Threat Landscape\\n' + r.landscape_summary);\n}\n\nif (r.trends && r.trends.length > 0) {\n  var tb = '## Emerging Trends';\n  for (var i = 0; i < r.trends.length; i++) {\n    var t = r.trends[i];\n    var tLevel = String(t.risk_level || 'unknown').toUpperCase();\n    tb += '\\n' + riskIcon(t.risk_level) + ' **[' + tLevel + ']** ' + t.trend;\n    if (t.evidence && t.evidence.length > 0) {\n      tb += '\\n> ' + t.evidence.map(function(e) { return linkTitle(e); }).join('\\n> ');\n    }\n  }\n  blocks.push(tb);\n}\n\nif (r.correlations && r.correlations.length > 0) {\n  var cb = '## Cross-Report Correlations';\n  for (var j = 0; j < r.correlations.length; j++) {\n    var c = r.correlations[j];\n    var conf = Math.round((c.confidence || 0) * 100);\n    var ctype = String(c.correlation_type || 'unknown').toUpperCase();\n    cb += '\\n\\n' + confIcon(c.confidence || 0) + ' **[' + ctype + ']** \\u2014 Confidence: ' + conf + '%';\n    var titles = c.reports || [];\n    for (var t2 = 0; t2 < titles.length; t2++) {\n      cb += '\\n> ' + linkTitle(titles[t2]);\n    }\n    var shared = Array.isArray(c.shared_elements) ? c.shared_elements.join(', ') : (c.shared_elements || '');\n    cb += '\\n> **Shared:** `' + shared + '`';\n  }\n  blocks.push(cb);\n}\n\nvar messages = [];\nvar current = '';\nfor (var b = 0; b < blocks.length; b++) {\n  var block = blocks[b];\n  if (current.length === 0) {\n    current = block;\n  } else if ((current + '\\n\\n' + block).length <= 1900) {\n    current += '\\n\\n' + block;\n  } else {\n    messages.push(current);\n    current = block;\n  }\n}\nif (current.trim()) messages.push(current);\n\nvar safe = [];\nfor (var s = 0; s < messages.length; s++) {\n  var msg = messages[s];\n  while (msg.length > 1950) {\n    var cut = msg.lastIndexOf('\\n', 1950);\n    if (cut < 500) cut = 1950;\n    safe.push(msg.substring(0, cut));\n    msg = msg.substring(cut).trim();\n  }\n  if (msg.length > 0) safe.push(msg);\n}\n\nreturn safe.map(function(m) { return { json: { content: m } }; });"
+      },
+      "id": "c760a10c-82b6-4fab-93f9-dc3815e7b76c",
+      "name": "Format Correlation for Discord",
+      "type": "n8n-nodes-base.code",
+      "position": [
+        4432,
+        1552
+      ],
+      "typeVersion": 2
+    },
+    {
+      "parameters": {
+        "jsCode": "var allReports = $('Merge AI Summary').all();\nvar date = new Date().toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' });\n\nvar icons = { critical: '\\ud83d\\udfe5', high: '\\ud83d\\udfe7', medium: '\\ud83d\\udfe8', low: '\\ud83d\\udfe9', info: '\\ud83d\\udfe6' };\n\nvar cards = [];\nfor (var i = 0; i < allReports.length; i++) {\n  var r = allReports[i].json;\n  var sev = (r.severity_assessment || 'info').toLowerCase();\n  var icon = icons[sev] || icons.info;\n  var url = '';\n  var refs = r.external_refs || [];\n  if (refs.length > 0 && refs[0].url) url = refs[0].url;\n  var titleLine = url ? icon + ' **[' + r.title + '](<' + url + '>)**' : icon + ' **' + r.title + '**';\n  var summaryLine = '> ' + (r.executive_summary || 'N/F');\n  var meta = [];\n  var actors = (r.threat_actors || []).filter(function(v) { return v && v !== 'N/F'; });\n  var malware = (r.malware_families || []).filter(function(v) { return v && v !== 'N/F'; });\n  var techniques = (r.attack_techniques || []).filter(function(v) { return v && v !== 'N/F'; });\n  var cves = (r.cves_mentioned || []).filter(function(v) { return v && v !== 'N/F'; });\n  if (actors.length > 0) meta.push('**Actors:** ' + actors.join(', '));\n  if (malware.length > 0) meta.push('**Malware:** ' + malware.join(', '));\n  if (techniques.length > 0) meta.push('**TTPs:** ' + techniques.join(', '));\n  if (cves.length > 0) meta.push('**CVEs:** ' + cves.join(', '));\n  meta.push('**Type:** ' + (r.report_type || 'N/F'));\n  if (r.created_by) meta.push('**Source:** ' + r.created_by);\n  var metaLine = '> ' + meta.join(' \\u2502 ');\n  var card = titleLine + '\\n' + summaryLine + '\\n' + metaLine;\n  cards.push(card);\n}\n\nvar header = '# Threat Intelligence Digest \\u2014 ' + date + '\\n**Reports Analysed:** ' + allReports.length + ' (Tier 1)';\nvar messages = [];\nvar current = header;\nfor (var j = 0; j < cards.length; j++) {\n  var next = current + '\\n\\n' + cards[j];\n  if (next.length > 1900) {\n    messages.push(current);\n    current = cards[j];\n  } else {\n    current = next;\n  }\n}\nif (current.trim()) messages.push(current);\nreturn messages.map(function(m) { return { json: { content: m } }; });"
+      },
+      "id": "89203ce8-c6eb-4184-9b66-f25aa35a0bef",
+      "name": "Format Summaries for Discord",
+      "type": "n8n-nodes-base.code",
+      "position": [
+        3664,
+        1936
+      ],
+      "typeVersion": 2
+    },
+    {
+      "parameters": {
+        "amount": 3
+      },
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        4704,
+        1552
+      ],
+      "id": "8c7dc475-16a9-4b7a-b035-954d65f6f88e",
+      "name": "Wait",
+      "webhookId": "9284156e-5106-4d04-a55b-26e01996fe2e"
+    },
+    {
+      "parameters": {
+        "amount": 3
+      },
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        3920,
+        1936
+      ],
+      "id": "98ed6d6b-17fd-4127-8a9b-6bea7f4174ff",
+      "name": "Wait1",
+      "webhookId": "9284156e-5106-4d04-a55b-26e01996fe2e"
+    },
+    {
+      "parameters": {
+        "resource": "message",
+        "guildId": {
+          "__rl": true,
+          "value": "",
+          "mode": "list",
+          "cachedResultName": ""
+        },
+        "channelId": {
+          "__rl": true,
+          "value": "",
+          "mode": "list",
+          "cachedResultName": "security-updates"
+        },
+        "content": "={{ $json.content }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.discord",
+      "typeVersion": 2,
+      "position": [
+        4176,
+        1936
+      ],
+      "id": "adabf5dd-a5de-4972-8f5e-accd373a4af8",
+      "name": "Discord — Summaries",
+      "webhookId": "c2b6040d-0737-454a-8d88-05df243cef30",
+      "retryOnFail": true,
+      "waitBetweenTries": 5000,
+      "maxTries": 3,
+      "executeOnce": false,
+      "credentials": {
+        "discordBotApi": {
+          "id": "jvu5L9xdxVYhJJDV",
+          "name": "Discord Bot account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "resource": "message",
+        "guildId": {
+          "__rl": true,
+          "value": "",
+          "mode": "list",
+          "cachedResultName": ""
+        },
+        "channelId": {
+          "__rl": true,
+          "value": "1477324563204538408",
+          "mode": "list",
+          "cachedResultName": "correlation-reports"
+        },
+        "content": "={{ $json.content }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.discord",
+      "typeVersion": 2,
+      "position": [
+        4960,
+        1552
+      ],
+      "id": "393c0f81-eb26-4567-9f15-fbc7b752eb58",
+      "name": "Discord — Correlations",
+      "webhookId": "c2b6040d-0737-454a-8d88-05df243cef30",
+      "retryOnFail": true,
+      "waitBetweenTries": 5000,
+      "credentials": {
+        "discordBotApi": {
+          "id": "jvu5L9xdxVYhJJDV",
+          "name": "Discord Bot account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "content": "## Tiered Threat Intelligence Pipeline v2\n\n**Tier 1 (Full AI — llama3.2):** RSS feeds, blogs, CISA, Krebs + IOC-containing Telegram\n→ Fetch → Ollama → Postgres → Discord + Correlation\n\n**Tier 2 (Light — no AI):** AlienVault OTX (top 20 by entity count)\n→ Metadata to Postgres + included in correlation\n\n**Tier 3 (Skip):** Microsoft Defender TI CVEs (~3,300+)\n**Tier 4 (Skip):** Telegram without IOCs/threat keywords\n\n**Correlation Model:** phi4 with 16K context, temp 0.3\n**Key improvement:** Pre-computed overlap hints fed to correlation model\n\n**Source IDs:**\n- Microsoft: 67209902-ed0f-4679-85f9-768d05a639b7\n- AlienVault: c998e145-ba64-47e8-8262-3333dee66dbb",
+        "height": 400,
+        "width": 800
+      },
+      "id": "a72dfe62-7e48-4efc-96ad-1d4171a052a8",
+      "name": "Sticky Note — Pipeline Overview",
+      "type": "n8n-nodes-base.stickyNote",
+      "position": [
+        816,
+        640
+      ],
+      "typeVersion": 1
+    },
+    {
+      "parameters": {
+        "model": "llama3.2:latest",
+        "options": {
+          "format": "json"
+        }
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatOllama",
+      "typeVersion": 1,
+      "position": [
+        3136,
+        1440
+      ],
+      "id": "5cc8b492-87c7-4ac9-bd01-25ecaff9c219",
+      "name": "Ollama Chat Model - Fast Processing",
+      "credentials": {
+        "ollamaApi": {
+          "id": "xHuYe0MDGOs9IpBW",
+          "name": "Local Ollama service"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "model": "phi4:latest",
+        "options": {
+          "temperature": 0.3,
+          "numCtx": 8192,
+          "format": "json"
+        }
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatOllama",
+      "typeVersion": 1,
+      "position": [
+        3920,
+        1744
+      ],
+      "id": "068758a5-d677-4506-8f43-200c629821e8",
+      "name": "Ollama Chat Model - Correlation Processing",
+      "credentials": {
+        "ollamaApi": {
+          "id": "xHuYe0MDGOs9IpBW",
+          "name": "Local Ollama service"
+        }
+      }
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Trigger — 07:00 & 19:00": {
+      "main": [
+        [
+          {
+            "node": "OpenCTI — Fetch Reports",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "OpenCTI — Fetch Reports": {
+      "main": [
+        [
+          {
+            "node": "Parse & Flatten Reports",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse & Flatten Reports": {
+      "main": [
+        [
+          {
+            "node": "Route by Source Tier",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Route by Source Tier": {
+      "main": [
+        [
+          {
+            "node": "IF Not Skipped",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF Not Skipped": {
+      "main": [
+        [
+          {
+            "node": "IF AlienVault",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF AlienVault": {
+      "main": [
+        [
+          {
+            "node": "AlienVault Light Process",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Prepare Article URL",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AlienVault Light Process": {
+      "main": [
+        [
+          {
+            "node": "AV Prepare for Postgres",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AV Prepare for Postgres": {
+      "main": [
+        [
+          {
+            "node": "Postgres — Insert AV Report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Article URL": {
+      "main": [
+        [
+          {
+            "node": "Fetch Full Article",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Full Article": {
+      "main": [
+        [
+          {
+            "node": "Extract Text & Merge",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract Text & Merge": {
+      "main": [
+        [
+          {
+            "node": "AI Agent - Analyse Report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AI Agent - Analyse Report": {
+      "main": [
+        [
+          {
+            "node": "Merge AI Summary",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Merge AI Summary": {
+      "main": [
+        [
+          {
+            "node": "Prepare for Postgres",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Build Correlation Prompt",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Format Summaries for Discord",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare for Postgres": {
+      "main": [
+        [
+          {
+            "node": "Postgres — Insert Report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Postgres — Insert Report": {
+      "main": [
+        [
+          {
+            "node": "Prepare Entities & Tags",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Entities & Tags": {
+      "main": [
+        [
+          {
+            "node": "Flatten for DB Insert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Flatten for DB Insert": {
+      "main": [
+        [
+          {
+            "node": "IF Entity or Tag",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF Entity or Tag": {
+      "main": [
+        [
+          {
+            "node": "Postgres — Insert Entity + Link",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Postgres — Insert Tag",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Correlation Prompt": {
+      "main": [
+        [
+          {
+            "node": "AI Agent - Correlate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AI Agent - Correlate": {
+      "main": [
+        [
+          {
+            "node": "Parse Correlation Results",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Correlation Results": {
+      "main": [
+        [
+          {
+            "node": "Format Correlation for Discord",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format Correlation for Discord": {
+      "main": [
+        [
+          {
+            "node": "Wait",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format Summaries for Discord": {
+      "main": [
+        [
+          {
+            "node": "Wait1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Wait": {
+      "main": [
+        [
+          {
+            "node": "Discord — Correlations",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Wait1": {
+      "main": [
+        [
+          {
+            "node": "Discord — Summaries",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Ollama Chat Model - Fast Processing": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "AI Agent - Analyse Report",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Ollama Chat Model - Correlation Processing": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "AI Agent - Correlate",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Discord — Summaries": {
+      "main": [
+        []
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate",
+    "availableInMCP": false,
+    "timeSavedMode": "fixed",
+    "callerPolicy": "workflowsFromSameOwner",
+    "timezone": "Etc/UTC"
+  },
+  "versionId": "8009541b-2862-4a4d-9fbd-ab52d4893920",
+  "meta": {
+    "instanceId": ""
+  },
+  "id": "G2dOwZrAeCmoiZmH",
+  "tags": []
+}
