@@ -99,7 +99,6 @@ Once the PostgreSQL container is running:
 ### 5. Feed Configuration
 A list of recommended feeds is available in `opencti/opencti_feeds_dump.txt`. Telegram feed utility scripts can be found in the telegram/ directory to assist with RSS-Bridge configuration.
 
-🧠 Models
 For details on the specific models (Llama 3.2, Phi-4) and system prompts used in this pipeline, please refer to the [Models Documentation](models/README.md).
 
 This repository contains the code and systems to allow anyone to adapt or use Cognitive CTI within their own network.
