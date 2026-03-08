@@ -1,8 +1,56 @@
+# Introduction
+
+Threat Intelligence is a fairly superfluous component to security for most individuals or organisations that are growing the security function. This is typically due to cost, scaling it into wider systems, or seeing the true value of running their own solution, when it is baked into anti-virus or provided by a Managed Detection and Response (MDR) provider.
+
+  
+
+This post outlines a modern solution to creating a scalable threat intelligence pipeline that does not compromise on functionality that organisations are implementing in this day and age. Whether you are looking to conduct solo research, proof-of-concept, or a larger team that has matured to the point of requiring a threat intelligence pillar to complement the security program, everyone should have access to threat intelligence at all stages of maturity.
+
+  
+
+The blog post is split into three sections:
+
+1. **System Requirements** - The section highlights the main system requirements of the implementation
+2. **Architecture** - The section focuses on the architectural view of the implementation, limitations, and potential adaptations that can fit into a wider ecosystem that has access to dedicated finances.
+3. **Implementation** - The section focuses on the implementation and the ideas behind each section in more detail
+4. **Technical Challenges** - The section discusses on the technical constraints and workarounds that were encountered during development
+5. **Bibliography** - This section provides hyperlinks to the resources used that aided in the development of this pipeline
+
+The split between the architectural layout and the implementation, is to entice all readers from leadership and design audiences through the architecture overview, as well as, the engineers and researchers who will are looking to use this as a foundation for their own implementation.
+
+All code and system files for the cognitive CTI project can be found at [github.com/jwhitt3r/cognitiveCTI](https://www.blogger.com/u/1/blog/post/edit/8882042398405863179/5023927187995908110?hl=en#).
+
+# System Requirements
+
+The motivation for this project sat with the idea of, could a self-hosted pipeline leveraging automation and artificial intelligence relate to systems built and maintained by an MDR (hey, they're the ones that actively enable this function at scale and sell it, what better role model). A number of constraints were placed on it, this is to ensure that it would enable any individual or teams to implement and adapt to meet the needs they may have. The following constraints were in place:
+
+- Self-hosted
+- Containers
+- Codified
+- Free (ignore electricity)
+- Modular
+
+The minimum resources used for this project, are:
+
+- 32GB RAM
+- GPU (for faster model processing)
+- Docker
+
+The system used in this project was:
+
+- Windows 11 Pro (For Hyper-V)
+- 128GB RAM
+- AMD Ryzen 7950X
+- Nvidia RTX 4070 Ti
+
+The GPU was only used to improve processing, extensive testing occurred using the CPU for its AI processing. However, it is encouraged that the GPU be used for actual more timely intel pipeline.
+
 # Architecture
 
 The following section provides a high-level architectural overview of the pipeline, its components, and how they interact with one another. The diagram is intentionally abstracted away from the implementation detail as to provide an accessible illustration of the system as to allow wider audiences with enough context to understand the system, its purpose, and where it can be adapted to fit into a wider ecosystem. The implementation sections that follow provide the detail for engineers and researchers looking to build on this foundation.
 
 Figure 1 illustrates the end-to-end flow from threat data collection through to output delivery of correlated and summarised threat intelligence.
+
 ![](diagrams/high_level_architecture.png)
 
 ## Intelligence Layer
@@ -285,7 +333,7 @@ Ollama's phi4 at 14B parameters requires approximately 9-10GB of RAM for model
 
 The resolution was to reduce numCtx to 8192, which halved the KV cache memory footprint. The correlation prompt for 37 reports fits within 8K tokens with the compressed report format. For implementations with more available memory or GPU offloading, numCtx can be increased to accommodate larger batches.
 
-Running both llama3.2 and phi4 simultaneously doubles the memory requirement. Setting OLLAMA_MAX_LOADED_MODELS=1 in the Ollama environment ensures one model is unloaded before the other is loaded, at the cost of a ~10 second model swap delay between the analysis and correlation stages.
+Running both llama3.2 and phi4 simultaneously doubles the memory requirement. Setting `OLLAMA_MAX_LOADED_MODELS=1` in the Ollama environment ensures one model is unloaded before the other is loaded, at the cost of a ~10 second model swap delay between the analysis and correlation stages.
 
 ## Article Fetch Reliability
 
@@ -298,3 +346,19 @@ This was the most persistent quality issue we encountered. When presented with m
 The mitigation is multi-layered: the prompt format uses --- REPORT: Exact Title ---headers, the system prompt explicitly forbids numbered references with wrong and correct examples, and the prompt includes an actual title from the current batch. The parse node additionally checks for numbered references in the output and can flag them. With phi4 at temperature 0.3, this combination produces correct titles in the majority of cases, though occasional mismatches still occur and are handled by the fuzzy title matching in the Discord formatter.
 
 _Researchers Note: Title hallucination is a well-documented behaviour in local language models when processing multiple documents. If you are implementing this with a cloud model (Claude, GPT-4o), you may find that a single instruction is sufficient. With local models at the 3-14B parameter range, the repeated reinforcement across system prompt, user prompt, and examples is necessary. However, there maybe further tweaks to the architecture required to scale to meet the enterprise demand._
+
+# Bibliography
+
+[1] - [Best Strategies to Minimize Hallucinations in LLMs: A Comprehensive Guide](https://www.blogger.com/u/1/blog/post/edit/8882042398405863179/5023927187995908110?hl=en#)
+
+[2] - [Bitsight Vulnerability Threat Intelligence](https://www.blogger.com/u/1/blog/post/edit/8882042398405863179/5023927187995908110?hl=en#)
+
+[3] - [MITRE ATT&CK](https://www.blogger.com/u/1/blog/post/edit/8882042398405863179/5023927187995908110?hl=en#)
+
+[4] - [n8n Beginner Course](https://www.blogger.com/u/1/blog/post/edit/8882042398405863179/5023927187995908110?hl=en#)
+
+[5] - [n8n Quick Start Tutorial: Build Your First AI Agent [2026]](https://www.blogger.com/u/1/blog/post/edit/8882042398405863179/5023927187995908110?hl=en#)
+
+[6] - [OpenCTI](https://www.blogger.com/u/1/blog/post/edit/8882042398405863179/5023927187995908110?hl=en#)
+
+[7] - [Self-hosted n8n AI Starter Kit](https://www.blogger.com/u/1/blog/post/edit/8882042398405863179/5023927187995908110?hl=en#)
